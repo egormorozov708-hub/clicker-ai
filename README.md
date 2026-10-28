@@ -4,6 +4,8 @@
 скриншотов, разметка, аугментация, обучение YOLOv8, авторазметка и работающий бот,
 который играет в игру на Яндекс Играх.
 
+**Репозиторий:** https://github.com/egormorozov708-hub/clicker-ai
+
 ![Пример детекции](docs/examples/screenshot_2026-10-27_191645.jpg)
 
 ![Полный цикл проекта](docs/pipeline.png)
@@ -213,21 +215,24 @@ data_final.yaml`: mAP, precision, recall). Авторазметка отвеча
 
 ## Публикация на GitHub
 
+Репозиторий проекта: **https://github.com/egormorozov708-hub/clicker-ai**
+
+Клонирование и запуск:
+
+```powershell
+git clone https://github.com/egormorozov708-hub/clicker-ai.git
+cd clicker-ai
+```
+
+Обновление репозитория после изменений:
+
 ```powershell
 git add .
-git commit -m "Clicker AI: YOLOv8-бот, датасет и отчёт"
-git branch -M main
-git remote add origin https://github.com/<ваш-логин>/clicker-ai.git
-git push -u origin main
+git commit -m "Описание изменений"
+git push
 ```
 
-Или через GitHub CLI:
-
-```powershell
-gh repo create clicker-ai --public --source=. --remote=origin --push
-```
-
-Ссылку на репозиторий нужно отправить на **polivanov_ed@itmoscow.pro**.
+Ссылка для отправки преподавателю: **polivanov_ed@itmoscow.pro**.
 
 ## Автор
 
