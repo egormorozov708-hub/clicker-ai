@@ -1,0 +1,23 @@
+{
+  "frames": 25,
+  "conf": 0.35,
+  "game_frames": 21,
+  "game_found": 21,
+  "game_iou": 0.843,
+  "game_passed_filter": 21,
+  "ad_frames": 3,
+  "ad_found": 3,
+  "ad_passed_filter": 3,
+  "tp": {
+    "game": 21,
+    "bonus": 19,
+    "improvement": 30,
+    "advertising": 3
+  },
+  "fp": {
+    "bonus": 1
+  },
+  "fn": {
+    "bonus": 2
+  }
+}

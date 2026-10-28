@@ -1,8 +1,0 @@
-# Актуальный конфиг датасета (4 класса).
-# Файл data_final.yaml — его же копия под именем, которое используют скрипты.
-path: ./dataset_final
-train: images/train
-val: images/val
-
-nc: 4
-names: ['game', 'upgrade', 'advertising', 'bonus']

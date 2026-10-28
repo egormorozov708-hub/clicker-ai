@@ -8,7 +8,7 @@
   * auto_labels/<имя>.txt   — формат YOLO (class xc yc w h).
 
 По умолчанию сохраняются все классы модели. Ограничить набор можно так:
-    python auto_label.py --model best.pt --classes game,upgrade
+    python auto_label.py --model best.pt --classes game,improvement
 
 Дальше разметку можно открыть в X-AnyLabeling, поправить и экспортировать.
 """

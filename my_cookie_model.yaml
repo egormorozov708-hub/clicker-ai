@@ -1,19 +1,20 @@
 # Конфигурация кастомной модели для авторазметки в X-AnyLabeling.
 # Перед использованием:
-#   1) обучите модель:            python train_final.py
-#   2) скопируйте веса:           best.pt в корень проекта
-#   3) экспортируйте в ONNX:      python ptToOnnx.py
-#   4) проверьте путь model_path ниже (можно указать относительный путь).
+#   1) соберите датасет:          python build_dataset.py
+#   2) обучите модель:            python train_final.py
+#   3) скопируйте веса:           best.pt в корень проекта
+#   4) экспортируйте в ONNX:      python ptToOnnx.py
+#   5) проверьте путь model_path ниже (можно указать относительный путь).
 type: yolov8
-name: clicker-4class-r20261028
+name: clicker-4class-r20261029
 provider: Ultralytics
-display_name: "Clicker: game / upgrade / ad / bonus"
+display_name: "Clicker: game / improvement / ad / bonus"
 model_path: "best.onnx"
 iou_threshold: 0.45
 conf_threshold: 0.25
 max_det: 300
 classes:
   - game
-  - upgrade
+  - improvement
   - advertising
   - bonus

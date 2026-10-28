@@ -1,10 +1,11 @@
-"""Clicker AI — бот для игры «Кликер: Становление шкафа».
+﻿"""Clicker AI — бот для игры «Кликер: Становление шкафа».
 
 Что умеет:
   * находит персонажа (класс game) и кликает по нему;
-  * покупает улучшения (класс upgrade);
-  * нажимает бонусные кнопки 2X / +100 (класс bonus);
-  * при желании нажимает кнопку отключения рекламы (класс advertising);
+  * раз в 30 секунд покупает одно улучшение по очереди (класс improvement),
+    затем сразу возвращается к кликам по game;
+  * закрывает рекламу крестиком (класс advertising);
+  * нажимает бонусные кнопки 2X / +1K (класс bonus);
   * показывает превью с рамками (--preview) или работает без окна.
 
 Запуск:
@@ -19,6 +20,7 @@
 Без pynput: Ctrl+C в консоли.
 
 Важно: бот кликает только когда активно окно игры (проверка по заголовку).
+Реклама закрывается автоматически; отключить: --no-close-ads.
 """
 
 from __future__ import annotations
@@ -48,10 +50,13 @@ except Exception:
 
 COLORS = {
     "game": (0, 255, 60),
-    "upgrade": (255, 200, 0),
+    "improvement": (255, 200, 0),
     "advertising": (255, 0, 255),
     "bonus": (0, 255, 255),
 }
+
+# В старых весах класс назывался upgrade — поддерживаем оба имени.
+ALIASES = {"upgrade": "improvement"}
 
 
 @dataclass
@@ -64,27 +69,36 @@ class Config:
     imgsz: int = 640
     conf: float = 0.45
     click_interval: float = 0.08
-    upgrade_interval: float = 3.0
+    upgrade_interval: float = 30.0
     bonus_interval: float = 12.0
-    ad_interval: float = 8.0
+    ad_cooldown: float = 3.0
     click_game: bool = True
-    click_upgrades: bool = True
+    click_improvements: bool = True
     click_bonuses: bool = True
-    close_ads: bool = False
+    close_ads: bool = True
+    allow_any_window: bool = False
     max_seconds: float = 0.0
 
 
 @dataclass
 class Stats:
     frames: int = 0
-    clicks: int = 0
+    game_clicks: int = 0
+    improvement_clicks: int = 0
+    bonus_clicks: int = 0
+    ad_clicks: int = 0
     started: float = field(default_factory=time.time)
     last_game_click: float = 0.0
-    last_upgrade_click: float = 0.0
-    last_bonus_click: float = 0.0
     last_ad_click: float = 0.0
-    upgrade_idx: int = 0
+    resume_game_at: float = 0.0
+    next_upgrade_at: float = 0.0
+    next_bonus_at: float = 0.0
+    improvement_idx: int = 0
     bonus_idx: int = 0
+
+    @property
+    def clicks(self) -> int:
+        return self.game_clicks + self.improvement_clicks + self.bonus_clicks + self.ad_clicks
 
     @property
     def fps(self) -> float:
@@ -122,28 +136,237 @@ def center(box: list[float]) -> tuple[int, int]:
     return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 
+def canonical(name: str) -> str:
+    return ALIASES.get(name, name)
+
+
 def valid_game_box(box: list[float], frame_w: int, frame_h: int) -> bool:
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
     if w < 12 or h < 35:
         return False
-    if h / max(w, 1.0) < 1.05:
+    if h / max(w, 1.0) < 0.65:
         return False
-    if (x1 + x2) / 2 > frame_w * 0.94:  # правая колонка с рекламой
+    if (x1 + x2) / 2 > frame_w * 0.97:  # правая колонка с рекламой
         return False
     return True
 
 
-def detect(model: YOLO, frame: np.ndarray, conf: float, imgsz: int) -> list[tuple[str, float, list[float]]]:
+def valid_improvement_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+    """Кнопки покупки — широкие, в нижней левой части игрового поля."""
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    if w < 70 or h < 28:
+        return False
+    if not (1.0 <= w / max(h, 1.0) <= 8.0):
+        return False
+    if x1 > frame_w * 0.65 or y1 < frame_h * 0.45:
+        return False
+    return True
+
+
+def valid_bonus_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+    """2X / +1K — квадратные кнопки в верхней левой части."""
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    if w < 55 or h < 45:
+        return False
+    if not (0.5 <= w / max(h, 1.0) <= 2.2):
+        return False
+    if x2 > frame_w * 0.75 or y2 > frame_h * 0.45:
+        return False
+    return True
+
+
+def valid_ad_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+    """Крестик рекламы: маленький, почти квадратный, в правой части кадра.
+
+    Попап может располагаться выше или ниже в зависимости от положения окна
+    браузера, поэтому по вертикали ограничение мягкое. Фильтр не даёт спутать
+    крестик с широкой кнопкой «Отключить рекламу» и с мелкими кнопками окна.
+    """
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    if not (40 <= w <= 200 and 40 <= h <= 200):
+        return False
+    if not (0.6 <= w / max(h, 1.0) <= 2.2):
+        return False
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    if cx < frame_w * 0.45 or cy > frame_h * 0.85:
+        return False
+    return True
+
+
+Detection = tuple[str, float, list[float]]
+
+
+def detect(model: YOLO, frame: np.ndarray, conf: float, imgsz: int) -> list[Detection]:
     result = model(frame, imgsz=imgsz, conf=conf, verbose=False)[0]
     detections = []
     for box in result.boxes:
-        name = model.names[int(box.cls)]
+        name = canonical(model.names[int(box.cls)])
         detections.append((name, float(box.conf), [float(v) for v in box.xyxy[0]]))
     return detections
 
 
-def draw(frame: np.ndarray, detections: list[tuple[str, float, list[float]]], stats: Stats, paused: bool) -> np.ndarray:
+def pick(
+    detections: list[Detection],
+    name: str,
+    frame_w: int,
+    frame_h: int,
+    validator,
+) -> Detection | None:
+    best = None
+    best_score = -1.0
+    for detection in detections:
+        if detection[0] != name:
+            continue
+        if not validator(detection[2], frame_w, frame_h):
+            continue
+        if detection[1] > best_score:
+            best = detection
+            best_score = detection[1]
+    return best
+
+
+def click_box(
+    box: list[float],
+    offset: tuple[int, int],
+    cfg: Config,
+    label: str,
+) -> None:
+    """Единый низкоуровневый клик: и для game, и для рекламы, и для кнопок."""
+    x, y = center(box)
+    if not cfg.dry_run:
+        pyautogui.click(offset[0] + x, offset[1] + y)
+    elif label != "game":
+        print(f"[dry-run] клик: {label} в ({offset[0] + x}, {offset[1] + y})")
+
+
+def click_game(
+    detections: list[Detection],
+    frame_w: int,
+    frame_h: int,
+    offset: tuple[int, int],
+    cfg: Config,
+    stats: Stats,
+    now: float,
+) -> bool:
+    best = pick(detections, "game", frame_w, frame_h, valid_game_box)
+    if best is None:
+        return False
+    if now - stats.last_game_click < cfg.click_interval:
+        return False
+    click_box(best[2], offset, cfg, "game")
+    stats.game_clicks += 1
+    stats.last_game_click = now
+    return True
+
+
+def close_ad(
+    detections: list[Detection],
+    frame_w: int,
+    frame_h: int,
+    offset: tuple[int, int],
+    cfg: Config,
+    stats: Stats,
+    now: float,
+) -> bool:
+    """Отдельное действие «закрыть рекламу» на той же основе, что и клик game."""
+    if not cfg.close_ads:
+        return False
+    if now - stats.last_ad_click < cfg.ad_cooldown:
+        return False
+    ad = pick(detections, "advertising", frame_w, frame_h, valid_ad_box)
+    if ad is None:
+        return False
+    click_box(ad[2], offset, cfg, "advertising")
+    stats.ad_clicks += 1
+    stats.last_ad_click = now
+    stats.resume_game_at = now + 1.0  # даём окну рекламы закрыться
+    prefix = "[dry-run] " if cfg.dry_run else ""
+    print(f"{prefix}Реклама закрыта (уверенность {ad[1]:.2f}), возвращаюсь к game.")
+    return True
+
+
+def buy_improvement(
+    detections: list[Detection],
+    frame_w: int,
+    frame_h: int,
+    offset: tuple[int, int],
+    cfg: Config,
+    stats: Stats,
+    now: float,
+) -> bool:
+    """Раз в upgrade_interval — одно улучшение, следующее по очереди."""
+    if not cfg.click_improvements:
+        return False
+    if now < stats.next_upgrade_at:
+        return False
+    improvements = sorted(
+        (
+            d for d in detections
+            if d[0] == "improvement"
+            and valid_improvement_box(d[2], frame_w, frame_h)
+        ),
+        key=lambda d: (d[2][1], d[2][0]),
+    )
+    if not improvements:
+        stats.next_upgrade_at = now + 1.0
+        return False
+    index = stats.improvement_idx % len(improvements)
+    box = improvements[index][2]
+    click_box(box, offset, cfg, f"improvement {index + 1}/{len(improvements)}")
+    stats.improvement_clicks += 1
+    stats.improvement_idx += 1
+    stats.next_upgrade_at = now + cfg.upgrade_interval
+    stats.resume_game_at = now + 0.4
+    prefix = "[dry-run] " if cfg.dry_run else ""
+    print(
+        f"{prefix}Купил улучшение {index + 1}/{len(improvements)}; "
+        f"следующее через {cfg.upgrade_interval:.0f} с, возвращаюсь к game."
+    )
+    return True
+
+
+def click_bonus(
+    detections: list[Detection],
+    frame_w: int,
+    frame_h: int,
+    offset: tuple[int, int],
+    cfg: Config,
+    stats: Stats,
+    now: float,
+) -> bool:
+    """2X / +1K: нажимаем по очереди, если бонус виден."""
+    if not cfg.click_bonuses:
+        return False
+    if now < stats.next_bonus_at:
+        return False
+    bonuses = sorted(
+        (
+            d for d in detections
+            if d[0] == "bonus" and valid_bonus_box(d[2], frame_w, frame_h)
+        ),
+        key=lambda d: (d[2][1], d[2][0]),
+    )
+    if not bonuses:
+        stats.next_bonus_at = now + 1.0
+        return False
+    index = stats.bonus_idx % len(bonuses)
+    click_box(bonuses[index][2], offset, cfg, f"bonus {index + 1}/{len(bonuses)}")
+    stats.bonus_clicks += 1
+    stats.bonus_idx += 1
+    stats.next_bonus_at = now + cfg.bonus_interval
+    return True
+
+
+def draw(
+    frame: np.ndarray,
+    detections: list[Detection],
+    stats: Stats,
+    paused: bool,
+) -> np.ndarray:
     canvas = frame.copy()
     for name, score, box in detections:
         color = COLORS.get(name, (200, 200, 200))
@@ -154,18 +377,16 @@ def draw(frame: np.ndarray, detections: list[tuple[str, float, list[float]]], st
             cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA,
         )
     status = "PAUSED" if paused else "RUNNING"
-    text = f"{status} | FPS {stats.fps:.1f} | clicks {stats.clicks}"
-    cv2.putText(canvas, text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    text = (
+        f"{status} | FPS {stats.fps:.1f} | game {stats.game_clicks} | "
+        f"improvement {stats.improvement_clicks} | ad {stats.ad_clicks}"
+    )
+    cv2.putText(canvas, text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     return canvas
 
 
 class Preview:
-    """Окно превью: OpenCV, а при сборке без GUI — Tkinter.
-
-    Официальные wheel-пакеты OpenCV для новых версий Python иногда собираются
-    без HighGUI (cv2.namedWindow падает с "The function is not implemented").
-    Tkinter входит в стандартную библиотеку, поэтому используется как резерв.
-    """
+    """Окно превью: OpenCV, а при сборке без GUI — Tkinter."""
 
     def __init__(self, max_width: int = 1280, max_height: int = 720):
         self.max_width = max_width
@@ -265,7 +486,7 @@ def setup_hotkeys(state: dict):
     return listener
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Clicker AI bot")
     parser.add_argument("--model", default="best.pt")
     parser.add_argument("--window", default="Кликер", help="часть заголовка окна игры")
@@ -274,17 +495,30 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="только детекция, без кликов")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--conf", type=float, default=0.45)
-    parser.add_argument("--click-interval", type=float, default=0.08)
-    parser.add_argument("--upgrade-interval", type=float, default=3.0)
-    parser.add_argument("--bonus-interval", type=float, default=12.0)
-    parser.add_argument("--ad-interval", type=float, default=8.0)
+    parser.add_argument("--click-interval", type=float, default=0.08,
+                        help="пауза между кликами по game, секунды")
+    parser.add_argument("--upgrade-interval", type=float, default=30.0,
+                        help="как часто покупать одно улучшение, секунды")
+    parser.add_argument("--bonus-interval", type=float, default=12.0,
+                        help="как часто нажимать бонус 2X/+1K, секунды")
+    parser.add_argument("--ad-cooldown", type=float, default=3.0,
+                        help="пауза между попытками закрыть рекламу, секунды")
     parser.add_argument("--no-game", action="store_true")
-    parser.add_argument("--no-upgrades", action="store_true")
+    parser.add_argument("--no-improvements", "--no-upgrades", dest="no_improvements",
+                        action="store_true")
     parser.add_argument("--no-bonuses", action="store_true")
-    parser.add_argument("--close-ads", action="store_true", help="нажимать кнопку «Отключить рекламу»")
+    parser.add_argument("--no-close-ads", action="store_true",
+                        help="не закрывать рекламу автоматически")
+    parser.add_argument("--close-ads", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--allow-any-window", action="store_true",
+                        help="кликать без найденного окна игры (по всему экрану)")
     parser.add_argument("--max-seconds", type=float, default=0.0, help="0 = без ограничения")
     parser.add_argument("--list-windows", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args.list_windows:
         list_windows()
@@ -301,11 +535,12 @@ def main() -> None:
         click_interval=args.click_interval,
         upgrade_interval=args.upgrade_interval,
         bonus_interval=args.bonus_interval,
-        ad_interval=args.ad_interval,
+        ad_cooldown=args.ad_cooldown,
         click_game=not args.no_game,
-        click_upgrades=not args.no_upgrades,
+        click_improvements=not args.no_improvements,
         click_bonuses=not args.no_bonuses,
-        close_ads=args.close_ads,
+        close_ads=not args.no_close_ads,
+        allow_any_window=args.allow_any_window,
         max_seconds=args.max_seconds,
     )
 
@@ -315,22 +550,37 @@ def main() -> None:
 
     print(f"Модель: {model_path}")
     model = YOLO(str(model_path))
-    print("Классы:", model.names)
+    print("Классы:", {i: canonical(n) for i, n in model.names.items()})
 
     window = find_window(cfg.window)
     if window:
         print(f"Окно игры: {window.title!r} ({window.left},{window.top},{window.width},{window.height})")
     else:
-        print(f"Окно «{cfg.window}» не найдено — работаю по всему экрану.")
+        print(f"Окно «{cfg.window}» не найдено.")
         print("Подсказка: python app.py --list-windows")
+        if cfg.allow_any_window:
+            print("Включён --allow-any-window: работаю по всему экрану.")
+        elif not cfg.dry_run:
+            print(
+                "Клики отключены, чтобы не нажимать в чужие окна. "
+                "Укажите --window или --allow-any-window."
+            )
 
     state = {"running": True, "paused": False}
     listener = setup_hotkeys(state)
     stats = Stats()
+    now = time.time()
+    stats.next_upgrade_at = now + cfg.upgrade_interval
+    stats.next_bonus_at = now + cfg.bonus_interval
 
     print("Старт. F8 — пауза, F9/Esc — выход." if listener else "Старт. Остановка: Ctrl+C.")
     if cfg.dry_run:
-        print("Режим --dry-run: кликов не будет.")
+        print("Режим --dry-run: кликов не будет, действия только пишутся в лог.")
+    print(
+        f"Улучшения: раз в {cfg.upgrade_interval:.0f} с по очереди; "
+        f"реклама: {'автоматически' if cfg.close_ads else 'выключена'}."
+    )
+
     preview = None
     if cfg.preview:
         try:
@@ -348,20 +598,27 @@ def main() -> None:
                 time.sleep(0.1)
                 continue
 
-            # область захвата: всё окно игры или весь экран
             region = None
-            offset_x = offset_y = 0
-            if cfg.crop_window and window:
-                region = (window.left, window.top, window.width, window.height)
-                offset_x, offset_y = window.left, window.top
+            offset = (0, 0)
+            try:
+                if cfg.crop_window and window:
+                    region = (window.left, window.top, window.width, window.height)
+                    offset = (window.left, window.top)
+                frame = grab_screen(region)
+            except Exception as exc:
+                if region is not None:
+                    print(f"Не удалось снять окно ({exc}), снимаю весь экран.")
+                    region = None
+                    offset = (0, 0)
+                    frame = grab_screen(None)
+                else:
+                    raise
 
-            frame = grab_screen(region)
             frame_h, frame_w = frame.shape[:2]
             detections = detect(model, frame, cfg.conf, cfg.imgsz)
             detections.sort(key=lambda d: d[1], reverse=True)
             stats.frames += 1
 
-            # проверяем, что игра в фокусе — иначе не кликаем по чужим окнам
             active_title = ""
             try:
                 active = gw.getActiveWindow()
@@ -369,58 +626,30 @@ def main() -> None:
             except Exception:
                 pass
             if window is None:
-                # окно не нашли — работаем по всему экрану, проверку фокуса пропускаем
-                game_active = True
+                game_active = cfg.allow_any_window or cfg.dry_run
             else:
                 game_active = bool(active_title and cfg.window.lower() in active_title.lower())
             can_click = game_active and not cfg.dry_run
 
             now = time.time()
-            best_game = None
-            for name, score, box in detections:
-                if name == "game" and valid_game_box(box, frame_w, frame_h):
-                    if best_game is None or score > best_game[0]:
-                        best_game = (score, box)
-            if best_game and cfg.click_game and can_click and now - stats.last_game_click >= cfg.click_interval:
-                x, y = center(best_game[1])
-                pyautogui.click(offset_x + x, offset_y + y)
-                stats.clicks += 1
-                stats.last_game_click = now
-
-            if cfg.click_upgrades and can_click and now - stats.last_upgrade_click >= cfg.upgrade_interval:
-                upgrades = sorted(
-                    (d for d in detections if d[0] == "upgrade"),
-                    key=lambda d: (d[2][1], d[2][0]),
-                )
-                if upgrades:
-                    box = upgrades[stats.upgrade_idx % len(upgrades)][2]
-                    x, y = center(box)
-                    pyautogui.click(offset_x + x, offset_y + y)
-                    stats.clicks += 1
-                    stats.upgrade_idx += 1
-                    stats.last_upgrade_click = now
-
-            if cfg.click_bonuses and can_click and now - stats.last_bonus_click >= cfg.bonus_interval:
-                bonuses = sorted(
-                    (d for d in detections if d[0] == "bonus"),
-                    key=lambda d: (d[2][1], d[2][0]),
-                )
-                if bonuses:
-                    box = bonuses[stats.bonus_idx % len(bonuses)][2]
-                    x, y = center(box)
-                    pyautogui.click(offset_x + x, offset_y + y)
-                    stats.clicks += 1
-                    stats.bonus_idx += 1
-                    stats.last_bonus_click = now
-
-            if cfg.close_ads and can_click and now - stats.last_ad_click >= cfg.ad_interval:
-                ads = [d for d in detections if d[0] == "advertising"]
-                if ads:
-                    x, y = center(ads[0][2])
-                    pyautogui.click(offset_x + x, offset_y + y)
-                    stats.clicks += 1
-                    stats.last_ad_click = now
-                    print("Нажал «Отключить рекламу» (страница может открыться).")
+            if can_click or cfg.dry_run:
+                # 1) Реклама — highest priority. Пока крестик виден, по игре не кликаем,
+                # даже если кулдаун ещё не прошёл: попап перекрывает сцену.
+                ad_visible = pick(
+                    detections, "advertising", frame_w, frame_h, valid_ad_box
+                ) is not None
+                if ad_visible:
+                    close_ad(detections, frame_w, frame_h, offset, cfg, stats, now)
+                # 2) Не кликаем по game, пока закрывается реклама/после покупки.
+                elif now < stats.resume_game_at:
+                    pass
+                # 3) Раз в 30 секунд — одно улучшение, затем снова game.
+                elif buy_improvement(detections, frame_w, frame_h, offset, cfg, stats, now):
+                    pass
+                else:
+                    if cfg.click_game:
+                        click_game(detections, frame_w, frame_h, offset, cfg, stats, now)
+                    click_bonus(detections, frame_w, frame_h, offset, cfg, stats, now)
 
             if cfg.preview and preview is not None:
                 shown = draw(frame, detections, stats, state["paused"])
@@ -428,10 +657,17 @@ def main() -> None:
                     break
 
             if now - last_log >= 1.0:
-                names = ", ".join(f"{n}:{sum(1 for d in detections if d[0] == n)}" for n in COLORS)
+                names = ", ".join(
+                    f"{n}:{sum(1 for d in detections if d[0] == n)}"
+                    for n in ("game", "improvement", "advertising", "bonus")
+                )
+                until_upgrade = max(0, int(stats.next_upgrade_at - now))
                 print(
-                    f"FPS {stats.fps:.1f} | кликов {stats.clicks} | объектов: {names}"
+                    f"FPS {stats.fps:.1f} | game {stats.game_clicks} | "
+                    f"improvement {stats.improvement_clicks} | bonus {stats.bonus_clicks} | "
+                    f"ad {stats.ad_clicks} | до улучшения {until_upgrade} с | объекты: {names}"
                     + ("" if game_active else " | окно игры не активно")
+                    + (" [dry-run]" if cfg.dry_run else "")
                 )
                 last_log = now
 
@@ -444,7 +680,12 @@ def main() -> None:
             preview.close()
         if listener:
             listener.stop()
-        print(f"Итог: кадров {stats.frames}, кликов {stats.clicks}, время {time.time() - stats.started:.1f} c.")
+        print(
+            f"Итог: кадров {stats.frames}, кликов {stats.clicks} "
+            f"(game {stats.game_clicks}, improvement {stats.improvement_clicks}, "
+            f"bonus {stats.bonus_clicks}, ad {stats.ad_clicks}), "
+            f"время {time.time() - stats.started:.1f} c."
+        )
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@ Pillow>=10.0
 opencv-python>=4.9
 numpy>=1.26
 PyYAML>=6.0
-albumentations>=2.0
 
 # Экспорт и проверка ONNX
 onnx>=1.16

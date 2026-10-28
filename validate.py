@@ -20,7 +20,7 @@ from ultralytics import YOLO
 
 COLORS = {
     "game": (0, 255, 60),
-    "upgrade": (255, 200, 0),
+    "improvement": (255, 200, 0),
     "advertising": (255, 0, 255),
     "bonus": (0, 255, 255),
 }
