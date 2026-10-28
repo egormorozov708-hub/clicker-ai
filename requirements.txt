@@ -1,0 +1,27 @@
+# Основные зависимости проекта Clicker AI.
+# Установка: pip install -r requirements.txt
+# Для CPU-версии PyTorch на Windows:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+ultralytics>=8.4,<9
+torch>=2.2
+torchvision>=0.17
+
+# Захват экрана и управление мышью
+pyautogui>=0.9.54
+pygetwindow>=0.0.9
+Pillow>=10.0
+
+# Компьютерное зрение и данные
+opencv-python>=4.9
+numpy>=1.26
+PyYAML>=6.0
+albumentations>=2.0
+
+# Экспорт и проверка ONNX
+onnx>=1.16
+onnxruntime>=1.18
+onnxslim>=0.1
+
+# Необязательно: горячие клавиши F8/F9 в app.py
+pynput>=1.7

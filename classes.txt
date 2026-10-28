@@ -1,0 +1,4 @@
+game
+upgrade
+advertising
+bonus

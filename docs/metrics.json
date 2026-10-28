@@ -1,0 +1,38 @@
+{
+  "overall": {
+    "precision": 0.9975,
+    "recall": 0.9623,
+    "map50": 0.9892,
+    "map50_95": 0.9071
+  },
+  "per_class": [
+    {
+      "class": "game",
+      "precision": 0.9942,
+      "recall": 1.0,
+      "map50": 0.995,
+      "map50_95": 0.7515
+    },
+    {
+      "class": "upgrade",
+      "precision": 1.0,
+      "recall": 0.8893,
+      "map50": 0.9719,
+      "map50_95": 0.9321
+    },
+    {
+      "class": "advertising",
+      "precision": 0.9957,
+      "recall": 1.0,
+      "map50": 0.995,
+      "map50_95": 0.9499
+    },
+    {
+      "class": "bonus",
+      "precision": 1.0,
+      "recall": 0.9598,
+      "map50": 0.995,
+      "map50_95": 0.995
+    }
+  ]
+}
