@@ -1,22 +1,25 @@
 ﻿"""Clicker AI — бот для игры «Кликер: Становление шкафа».
 
 Что умеет:
-  * находит персонажа (класс game) и кликает по нему;
+  * находит основной кликабельный объект (класс game) и кликает по нему;
   * раз в 30 секунд покупает одно улучшение по очереди (класс improvement),
     затем сразу возвращается к кликам по game;
   * закрывает рекламу крестиком (класс advertising);
   * нажимает бонусные кнопки 2X / +1K (класс bonus);
   * показывает превью с рамками (--preview) или работает без окна.
 
+Инференс — ONNX Runtime, без зависимости от Ultralytics в рабочем боте.
+
 Запуск:
-    python app.py --model best.pt
-    python app.py --model best.pt --preview --dry-run
-    python app.py --model best.pt --window "Кликер" --crop-window
+    python app.py --model best.onnx
+    python app.py --model best.onnx --preview --dry-run
+    python app.py --model best.onnx --window "Кликер" --crop-window
 
 Горячие клавиши (если установлен pynput):
-    F8  — пауза / продолжить
-    F9  — выход
-    Esc — выход
+    Пробел — остановка
+    F8     — пауза / продолжить
+    F9     — выход
+    Esc    — выход
 Без pynput: Ctrl+C в консоли.
 
 Важно: бот кликает только когда активно окно игры (проверка по заголовку).
@@ -32,9 +35,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import onnxruntime as ort
 import pyautogui
 import pygetwindow as gw
-from ultralytics import YOLO
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.0
@@ -57,17 +60,32 @@ COLORS = {
 
 # В старых весах класс назывался upgrade — поддерживаем оба имени.
 ALIASES = {"upgrade": "improvement"}
+CLASS_NAMES_DEFAULT = ["game", "improvement", "advertising", "bonus"]
+
+
+def load_class_names() -> list[str]:
+    """Имена классов из classes.txt рядом с app.py (или значения по умолчанию)."""
+    path = Path(__file__).with_name("classes.txt")
+    if path.exists():
+        names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+        names = [name for name in names if name]
+        if names:
+            return names
+    return CLASS_NAMES_DEFAULT
 
 
 @dataclass
 class Config:
-    model: str = "best.pt"
+    model: str = "best.onnx"
     window: str = "Кликер"
     crop_window: bool = False
     preview: bool = False
     dry_run: bool = False
     imgsz: int = 640
     conf: float = 0.45
+    iou: float = 0.45
+    max_det: int = 100
+    threads: int = 0
     click_interval: float = 0.08
     upgrade_interval: float = 30.0
     bonus_interval: float = 12.0
@@ -200,13 +218,139 @@ def valid_ad_box(box: list[float], frame_w: int, frame_h: int) -> bool:
 Detection = tuple[str, float, list[float]]
 
 
-def detect(model: YOLO, frame: np.ndarray, conf: float, imgsz: int) -> list[Detection]:
-    result = model(frame, imgsz=imgsz, conf=conf, verbose=False)[0]
-    detections = []
-    for box in result.boxes:
-        name = canonical(model.names[int(box.cls)])
-        detections.append((name, float(box.conf), [float(v) for v in box.xyxy[0]]))
-    return detections
+class OnnxDetector:
+    """YOLOv8-детектор на ONNX Runtime: letterbox, инференс и NMS вручную."""
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        conf: float = 0.45,
+        iou: float = 0.45,
+        max_det: int = 100,
+        imgsz: int = 640,
+        threads: int = 0,
+    ):
+        self.conf = float(conf)
+        self.iou = float(iou)
+        self.max_det = int(max_det)
+        self.names = [canonical(name) for name in load_class_names()]
+
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if threads > 0:
+            options.intra_op_num_threads = int(threads)
+        self.session = ort.InferenceSession(
+            str(model_path), sess_options=options, providers=["CPUExecutionProvider"]
+        )
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_names = [output.name for output in self.session.get_outputs()]
+
+        shape = self.session.get_inputs()[0].shape
+        model_size = shape[2] if len(shape) == 4 and isinstance(shape[2], int) else None
+        if model_size:
+            if int(imgsz) != int(model_size):
+                print(
+                    f"Размер входа ONNX — {model_size}x{model_size}; "
+                    f"параметр --imgsz {imgsz} игнорируется."
+                )
+            self.imgsz = int(model_size)
+        else:
+            self.imgsz = int(imgsz)
+
+    @staticmethod
+    def _letterbox(image: np.ndarray, size: int):
+        height, width = image.shape[:2]
+        ratio = min(size / height, size / width)
+        new_w, new_h = round(width * ratio), round(height * ratio)
+        if (new_w, new_h) != (width, height):
+            image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        pad_w, pad_h = size - new_w, size - new_h
+        left, top = pad_w // 2, pad_h // 2
+        image = cv2.copyMakeBorder(
+            image, top, pad_h - top, left, pad_w - left,
+            cv2.BORDER_CONSTANT, value=(114, 114, 114),
+        )
+        return image, ratio, (left, top)
+
+    @staticmethod
+    def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thres: float) -> np.ndarray:
+        order = scores.argsort()[::-1]
+        keep = []
+        while order.size:
+            i = int(order[0])
+            keep.append(i)
+            if order.size == 1:
+                break
+            rest = order[1:]
+            xx1 = np.maximum(boxes[i, 0], boxes[rest, 0])
+            yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
+            xx2 = np.minimum(boxes[i, 2], boxes[rest, 2])
+            yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
+            inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+            area_i = (boxes[i, 2] - boxes[i, 0]) * (boxes[i, 3] - boxes[i, 1])
+            area_rest = (boxes[rest, 2] - boxes[rest, 0]) * (boxes[rest, 3] - boxes[rest, 1])
+            union = area_i + area_rest - inter
+            overlap = np.divide(inter, union, out=np.zeros_like(inter), where=union > 0)
+            order = rest[overlap <= iou_thres]
+        return np.asarray(keep, dtype=np.int64)
+
+    def detect(self, frame: np.ndarray, conf: float | None = None) -> list[Detection]:
+        conf = self.conf if conf is None else float(conf)
+        image, ratio, (pad_x, pad_y) = self._letterbox(frame, self.imgsz)
+        blob = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        blob = blob.transpose(2, 0, 1).astype(np.float32) / 255.0
+        blob = np.ascontiguousarray(blob[None])
+
+        output = self.session.run(self.output_names, {self.input_name: blob})[0]
+        pred = np.asarray(output, dtype=np.float32)
+        if pred.ndim == 3:
+            pred = pred[0]
+        if pred.ndim != 2:
+            raise RuntimeError(f"Неожиданная форма выхода ONNX: {output.shape}")
+        expected = 4 + len(self.names)
+        if pred.shape[0] == expected and pred.shape[1] != expected:
+            pred = pred.T
+        if pred.shape[1] != expected:
+            raise RuntimeError(
+                f"ONNX вернул {pred.shape[1]} колонок, ожидалось {expected} "
+                f"(4 координаты + {len(self.names)} классов)."
+            )
+
+        boxes_xywh = pred[:, :4]
+        class_scores = pred[:, 4:]
+        class_ids = class_scores.argmax(axis=1)
+        scores = class_scores[np.arange(class_scores.shape[0]), class_ids]
+        mask = np.isfinite(scores) & (scores >= conf)
+        if not mask.any():
+            return []
+        boxes_xywh = boxes_xywh[mask]
+        scores = scores[mask]
+        class_ids = class_ids[mask]
+
+        boxes = np.empty_like(boxes_xywh)
+        boxes[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2
+        boxes[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2
+        boxes[:, 2] = boxes_xywh[:, 0] + boxes_xywh[:, 2] / 2
+        boxes[:, 3] = boxes_xywh[:, 1] + boxes_xywh[:, 3] / 2
+
+        frame_h, frame_w = frame.shape[:2]
+        kept: list[int] = []
+        for cls in np.unique(class_ids):
+            idx = np.flatnonzero(class_ids == cls)
+            kept.extend(idx[self._nms(boxes[idx], scores[idx], self.iou)].tolist())
+        kept.sort(key=lambda i: scores[i], reverse=True)
+
+        detections: list[Detection] = []
+        for i in kept[: self.max_det]:
+            x1 = (boxes[i, 0] - pad_x) / ratio
+            y1 = (boxes[i, 1] - pad_y) / ratio
+            x2 = (boxes[i, 2] - pad_x) / ratio
+            y2 = (boxes[i, 3] - pad_y) / ratio
+            x1, x2 = np.clip([x1, x2], 0, frame_w)
+            y1, y2 = np.clip([y1, y2], 0, frame_h)
+            name = self.names[int(class_ids[i])] if int(class_ids[i]) < len(self.names) else "object"
+            detections.append((name, float(scores[i]), [float(x1), float(y1), float(x2), float(y2)]))
+        return detections
 
 
 def pick(
@@ -420,6 +564,7 @@ class Preview:
         self._root.title("Clicker AI")
         self._root.protocol("WM_DELETE_WINDOW", self.close)
         self._root.bind("<Escape>", lambda _event: self.close())
+        self._root.bind("<space>", lambda _event: self.close())
         self._root.bind("q", lambda _event: self.close())
         self._label = tk.Label(self._root, bg="black")
         self._label.pack(fill="both", expand=True)
@@ -472,6 +617,10 @@ def setup_hotkeys(state: dict):
         return None
 
     def on_press(key):
+        if key == keyboard.Key.space:
+            print("Пробел — остановка.")
+            state["running"] = False
+            return False
         if key == keyboard.Key.f8:
             state["paused"] = not state["paused"]
             print("Пауза" if state["paused"] else "Продолжаем")
@@ -487,14 +636,22 @@ def setup_hotkeys(state: dict):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Clicker AI bot")
-    parser.add_argument("--model", default="best.pt")
+    parser = argparse.ArgumentParser(description="Clicker AI bot (ONNX Runtime)")
+    parser.add_argument("--model", default="best.onnx", help="путь к ONNX-модели")
     parser.add_argument("--window", default="Кликер", help="часть заголовка окна игры")
     parser.add_argument("--crop-window", action="store_true", help="захватывать только окно игры")
     parser.add_argument("--preview", action="store_true", help="показывать окно с детекцией")
     parser.add_argument("--dry-run", action="store_true", help="только детекция, без кликов")
-    parser.add_argument("--imgsz", type=int, default=640)
-    parser.add_argument("--conf", type=float, default=0.45)
+    parser.add_argument("--imgsz", type=int, default=640,
+                        help="размер входа; для ONNX берётся из модели")
+    parser.add_argument("--conf", type=float, default=0.45,
+                        help="порог уверенности детекций, 0..1")
+    parser.add_argument("--iou", type=float, default=0.45,
+                        help="порог IoU для NMS, 0..1")
+    parser.add_argument("--max-det", type=int, default=100,
+                        help="максимум детекций на кадр")
+    parser.add_argument("--threads", type=int, default=0,
+                        help="потоки ONNX Runtime; 0 = авто")
     parser.add_argument("--click-interval", type=float, default=0.08,
                         help="пауза между кликами по game, секунды")
     parser.add_argument("--upgrade-interval", type=float, default=30.0,
@@ -517,12 +674,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    for name in ("conf", "iou"):
+        value = getattr(args, name)
+        if not 0.0 <= value <= 1.0:
+            parser.error(f"--{name} должен быть в диапазоне 0..1")
+    if args.max_det < 1:
+        parser.error("--max-det должен быть >= 1")
+    if args.threads < 0:
+        parser.error("--threads должен быть >= 0")
+    for name in ("click_interval", "upgrade_interval", "bonus_interval", "ad_cooldown", "max_seconds"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name.replace('_', '-')} должен быть >= 0")
+
+
 def main() -> None:
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
 
     if args.list_windows:
         list_windows()
         return
+    validate_args(parser, args)
 
     cfg = Config(
         model=args.model,
@@ -532,6 +705,9 @@ def main() -> None:
         dry_run=args.dry_run,
         imgsz=args.imgsz,
         conf=args.conf,
+        iou=args.iou,
+        max_det=args.max_det,
+        threads=args.threads,
         click_interval=args.click_interval,
         upgrade_interval=args.upgrade_interval,
         bonus_interval=args.bonus_interval,
@@ -546,11 +722,25 @@ def main() -> None:
 
     model_path = Path(cfg.model)
     if not model_path.exists():
-        raise SystemExit(f"Модель не найдена: {model_path}. Сначала обучите её или укажите --model.")
+        raise SystemExit(
+            f"Модель не найдена: {model_path}. Укажите --model best.onnx "
+            "или выполните python ptToOnnx.py."
+        )
 
     print(f"Модель: {model_path}")
-    model = YOLO(str(model_path))
-    print("Классы:", {i: canonical(n) for i, n in model.names.items()})
+    try:
+        detector = OnnxDetector(
+            model_path,
+            conf=cfg.conf,
+            iou=cfg.iou,
+            max_det=cfg.max_det,
+            imgsz=cfg.imgsz,
+            threads=cfg.threads,
+        )
+    except Exception as exc:
+        raise SystemExit(f"Не удалось загрузить ONNX-модель: {exc}") from exc
+    print(f"ONNX Runtime {ort.__version__}, вход {detector.imgsz}x{detector.imgsz}")
+    print("Классы:", {i: name for i, name in enumerate(detector.names)})
 
     window = find_window(cfg.window)
     if window:
@@ -573,7 +763,7 @@ def main() -> None:
     stats.next_upgrade_at = now + cfg.upgrade_interval
     stats.next_bonus_at = now + cfg.bonus_interval
 
-    print("Старт. F8 — пауза, F9/Esc — выход." if listener else "Старт. Остановка: Ctrl+C.")
+    print("Старт. Пробел — стоп, F8 — пауза, F9/Esc — выход." if listener else "Старт. Остановка: Ctrl+C.")
     if cfg.dry_run:
         print("Режим --dry-run: кликов не будет, действия только пишутся в лог.")
     print(
@@ -585,6 +775,10 @@ def main() -> None:
     if cfg.preview:
         try:
             preview = Preview()
+            print(
+                "Превью включено для отладки: окно превью перехватывает фокус, "
+                "поэтому для реальных кликов запускайте бота без --preview."
+            )
         except RuntimeError as exc:
             print(f"Превью недоступно: {exc}")
             cfg.preview = False
@@ -615,7 +809,7 @@ def main() -> None:
                     raise
 
             frame_h, frame_w = frame.shape[:2]
-            detections = detect(model, frame, cfg.conf, cfg.imgsz)
+            detections = detector.detect(frame, cfg.conf)
             detections.sort(key=lambda d: d[1], reverse=True)
             stats.frames += 1
 
@@ -653,7 +847,8 @@ def main() -> None:
 
             if cfg.preview and preview is not None:
                 shown = draw(frame, detections, stats, state["paused"])
-                if preview.show(shown) in (ord("q"), 27):
+                key = preview.show(shown)
+                if key == -1 or key in (ord("q"), 27, 32):
                     break
 
             if now - last_log >= 1.0:

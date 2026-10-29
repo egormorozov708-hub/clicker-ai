@@ -1,14 +1,14 @@
 """Автоматическая разметка новых скриншотов обученной моделью.
 
 Запуск:
-    python auto_label.py --model best.pt --source screenshots --out auto_labels
+    python auto_label.py --model best.onnx --source screenshots --out auto_labels
 
 Для каждой картинки без .json создаётся:
   * auto_labels/<имя>.json  — формат X-AnyLabeling (можно открыть и проверить);
   * auto_labels/<имя>.txt   — формат YOLO (class xc yc w h).
 
 По умолчанию сохраняются все классы модели. Ограничить набор можно так:
-    python auto_label.py --model best.pt --classes game,improvement
+    python auto_label.py --model best.onnx --classes game,improvement
 
 Дальше разметку можно открыть в X-AnyLabeling, поправить и экспортировать.
 """
@@ -55,7 +55,7 @@ def to_anylabeling(image_path: Path, shapes: list[dict], w: int, h: int) -> dict
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="best.pt")
+    parser.add_argument("--model", default="best.onnx")
     parser.add_argument("--source", default="screenshots")
     parser.add_argument("--out", default="auto_labels")
     parser.add_argument("--conf", type=float, default=0.25)

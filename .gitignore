@@ -17,14 +17,17 @@ Thumbs.db
 desktop.ini
 .DS_Store
 
-# Временные файлы Ultralytics / обучение
-runs/
+# Ultralytics / обучение.
+# В репозиторий попадает только лучший прогон обучения.
+runs/*
+!runs/detect/
+runs/detect/*
+!runs/detect/clicker_levels/
+!runs/detect/clicker_levels/**
 *.cache
 yolov8n.pt
-weights/
 
 # Копии графиков обучения, которые Ultralytics иногда пишет в корень.
-# Актуальные версии лежат в docs/training/.
 /results.png
 /results.csv
 /confusion_matrix*.png
@@ -37,18 +40,23 @@ weights/
 /ai_vision.jpg
 /auto_boxes.json
 
-# Сырые и производные данные (слишком большие для GitHub).
-# Датасет для обучения остаётся в dataset_final/ и включён в репозиторий.
-screenshots/
-advertising/
-level 2/
-labels/
-screenshots_augmented/
-auto_labels/
-dataset/
-dataset_v2/
-dataset_aug/
-data_aug.yaml
+# Локальные данные, старые веса и служебные файлы.
+# На GitHub они не нужны: итоговая модель лежит в runs/detect/clicker_levels/weights/best.pt.
+/dataset_final/
+/best.pt
+/bestV1.pt
+/NOTES_bestV1.txt
+/game_boxes.json
+/screenshots/
+/advertising/
+/level 2/
+/labels/
+/screenshots_augmented/
+/auto_labels/
+/dataset/
+/dataset_v2/
+/dataset_aug/
+/data_aug.yaml
 
 # Локальные копии
 ~$*

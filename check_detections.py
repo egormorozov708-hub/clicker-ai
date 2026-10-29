@@ -1,7 +1,7 @@
 """Проверка детекций итоговой модели на датасете (практические метрики).
 
 Запуск:
-    python check_detections.py --model best.pt --conf 0.35
+    python check_detections.py --model runs/detect/clicker_levels/weights/best.pt --conf 0.35
 
 Скрипт сравнивает предсказания с ground truth по IoU и печатает:
   * сколько кадров содержат корректную рамку game;
@@ -77,7 +77,9 @@ def app_ad_box_ok(box, w: int, h: int) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="best.pt")
+    parser.add_argument(
+        "--model", default="runs/detect/clicker_levels/weights/best.pt"
+    )
     parser.add_argument("--images", default="dataset_final/images/val")
     parser.add_argument("--labels", default="dataset_final/labels/val")
     parser.add_argument("--conf", type=float, default=0.35)

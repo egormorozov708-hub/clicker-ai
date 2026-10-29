@@ -1,8 +1,8 @@
 """Проверка модели на папке со скриншотами и сохранение примеров детекции.
 
 Запуск:
-    python validate.py --model best.pt --source screenshots --limit 8
-    python validate.py --model best.pt --data data_final.yaml
+    python validate.py --model runs/detect/clicker_levels/weights/best.pt --source "level 2" --limit 8
+    python validate.py --model runs/detect/clicker_levels/weights/best.pt --data data_final.yaml
 
 Первый режим рисует найденные объекты и складывает картинки в docs/examples.
 Второй считает метрики mAP на отложенной выборке val.
@@ -28,7 +28,9 @@ COLORS = {
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="best.pt")
+    parser.add_argument(
+        "--model", default="runs/detect/clicker_levels/weights/best.pt"
+    )
     parser.add_argument("--source", default="screenshots")
     parser.add_argument("--data", default="")
     parser.add_argument("--conf", type=float, default=0.35)

@@ -6,7 +6,11 @@
 
 **Репозиторий:** https://github.com/egormorozov708-hub/clicker-ai
 
-![Пример детекции](docs/examples/screenshot_2026-10-28_210939.png)
+![Пример детекции: персонаж и кнопки улучшений](docs/examples/detection_level1.jpg)
+
+![Пример детекции: второй уровень](docs/examples/detection_level2.jpg)
+
+![Закрытие рекламы по крестику](docs/examples/detection_advertising.jpg)
 
 ![Полный цикл проекта](docs/pipeline.png)
 
@@ -14,7 +18,7 @@
 
 | Класс модели | Что это на экране | Что делает `app.py` |
 |---|---|---|
-| `game` | персонаж текущего уровня (на 1-м и 2-м уровне — разные персонажи) | кликает по центру лучшей рамки — основной клик |
+| `game` | персонаж текущего уровня (на 1-м и 2-м уровне — разные персонажи) | кликает по центру лучшей рамки — основной клик по печеньке/персонажу |
 | `improvement` | кнопки покупки улучшений в левом нижнем углу | раз в 30 секунд покупает **одну** кнопку, следующую по очереди, затем возвращается к `game` |
 | `advertising` | крестик `X` закрытия рекламного окна справа сверху | автоматически закрывает рекламу тем же кликом, что и по `game` |
 | `bonus` | кнопки «2X», «+1K» в левой верхней части | нажимает бонусы по таймеру |
@@ -22,18 +26,23 @@
 Бот:
 
 * захватывает экран или только окно игры;
-* ищет объекты моделью YOLOv8n и рисует рамки в режиме `--preview`;
+* запускает **ONNX-модель через ONNX Runtime** (Ultralytics нужен только для
+  обучения и подготовки данных, в рабочем боте не используется);
+* рисует рамки в режиме `--preview`;
 * кликает только когда окно игры активно (проверка по заголовку); если окно не
   найдено, клики отключаются, пока не указан `--allow-any-window`;
 * закрывает рекламу автоматически (отключается флагом `--no-close-ads`);
 * покупает улучшения по очереди раз в 30 секунд (`--upgrade-interval`);
-* имеет аварийную остановку: мышь в левом верхнем углу, `F8` — пауза,
-  `F9`/`Esc` — выход, `Ctrl+C` в консоли;
+* нажимает бонусы раз в 12 секунд (`--bonus-interval`);
+* останавливается на **Пробел**, ставится на паузу по `F8`, выходит по `F9`/`Esc`;
+* имеет защиту `pyautogui` (мышь в левом верхнем углу) и `Ctrl+C`;
 * умеет работать вхолостую: `--dry-run` показывает детекцию без кликов.
 
 ## Классы и датасет
 
-Датасет собран из трёх источников и покрывает два уровня игры:
+Датасет собран из трёх источников и покрывает два уровня игры. В репозиторий он
+**не входит** (это требование к чистому GitHub); локально он собирается скриптом
+`build_dataset.py`.
 
 | Источник | Кадров | Что размечено |
 |---|---:|---|
@@ -57,10 +66,16 @@
 
 ## Результаты обучения
 
-Модель: **YOLOv8n**, дообучение предыдущей версии `best.pt` на объединённом
-датасете: 40 эпох, `imgsz=640`, `batch=16`, CPU, `patience=12`, `lr0=0.002`,
-косинусное расписание, `warmup_epochs=3`, `close_mosaic=10`, seed 0.
-Итоговые веса: `best.pt` (4 класса), ONNX-копия: `best.onnx`.
+Модель: **YOLOv8n**, дообучение предыдущей версии на объединённом датасете:
+40 эпох, `imgsz=640`, `batch=16`, CPU, `patience=12`, `lr0=0.002`, косинусное
+расписание, `warmup_epochs=3`, `close_mosaic=10`, seed 0.
+
+В репозитории хранится **один лучший прогон**:
+
+* `runs/detect/clicker_levels/weights/best.pt` — итоговые веса YOLOv8n (4 класса);
+* `runs/detect/clicker_levels/results.png`, `results.csv`, кривые, матрица ошибок
+  и примеры предсказаний — артефакты этого же прогона;
+* `best.onnx` — та же модель в ONNX, именно её использует `app.py`.
 
 | Метрика | Значение |
 |---|---:|
@@ -78,28 +93,31 @@
 | `advertising` | 0.911 | 1.000 | 0.995 | 0.531 |
 | `bonus` | 0.951 | 0.919 | 0.987 | 0.987 |
 
-Практическая проверка `check_detections.py` (conf = 0.35): персонаж найден на 21/21 кадрах, средний IoU = 0.843, фильтр `app.py` прошли 21 рамок `game` и 3 из 3 рамок `advertising`. FP: bonus=1; FN: bonus=2.
+Практическая проверка `check_detections.py` (conf = 0.35): персонаж найден на
+21/21 кадрах, средний IoU = 0.843, фильтр `app.py` прошли 21 рамка `game` и
+3 из 3 рамок `advertising`. FP: bonus=1; FN: bonus=2.
 
-**Сквозной тест `app.py` в режиме `--dry-run`** (синтетическое полноэкранное окно
-`ClickerTest`, клики только логировались):
+**Сквозной тест `app.py` на ONNX Runtime в режиме `--dry-run`** (синтетическое
+полноэкранное окно `ClickerTest`, клики только логировались):
 
-- второй уровень, `--upgrade-interval 3 --no-bonuses`, 12 с: бот стабильно
+- второй уровень, `--upgrade-interval 3 --no-bonuses`, 8 с: бот стабильно
   находил `game` и 4 кнопки `improvement`, раз в 3 с покупал ровно одно
-  улучшение по очереди («1/4», «2/4», «3/4»), итого 73 действия;
-- рекламный попап поверх игры, 8 с: крестик `advertising` найден с
+  улучшение по очереди («1/4», «2/4»), итого 40 действий;
+- рекламный попап поверх игры, 7 с: крестик `advertising` найден с
   уверенностью 0.95, пока реклама видна, кликов по `game` не было; закрытие
-  повторялось с кулдауном 3 с, итого 3 действия только по рекламе.
+  повторялось с кулдауном 3 с, итого 3 действия только по рекламе;
+- остановка по **Пробелу** проверена отдельно (с превью и без): процесс
+  завершается, в консоли печатается итоговая статистика.
 
-Оба сценария подтверждают: улучшения покупаются по одному с возвратом к
-`game`, реклама имеет приоритет, общий примитив `click_box()` используется для
-всех действий.
+Подробный лог: `docs/app_test.txt`.
 
-![Кривые обучения](docs/training/results.png)
+![Кривые обучения](runs/detect/clicker_levels/results.png)
 
-![Матрица ошибок](docs/training/confusion_matrix.png)
+![Матрица ошибок](runs/detect/clicker_levels/confusion_matrix.png)
 
-Графики обучения, матрица ошибок и примеры предсказаний: `docs/training/`.
-Исходные метрики в машинном виде: `docs/metrics.json`.
+Графики обучения, матрица ошибок и примеры предсказаний:
+`runs/detect/clicker_levels/`. Исходные метрики в машинном виде:
+`docs/metrics.json`, `docs/check.json`.
 
 ## Быстрый старт
 
@@ -112,30 +130,44 @@ python -m venv .venv
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 pip install -r requirements.txt
 
-# 3. Проверить, что модель видит объекты на скриншотах
-python validate.py --model best.pt --source "level 2" --limit 8
+# 3. Запустить бота (окно игры должно быть активно)
+python app.py
 
-# 4. Запустить бота (окно игры должно быть активно)
-python app.py --model best.pt --preview
-
-# 5. Проверка логики без кликов: улучшение каждые 3 секунды
-python app.py --model best.pt --dry-run --upgrade-interval 3 --max-seconds 20
+# 4. Проверка логики без кликов: улучшение каждые 3 секунды
+python app.py --dry-run --upgrade-interval 3 --max-seconds 20
 ```
+
+`app.py --help` показывает все параметры. По умолчанию:
+
+| Параметр | Значение |
+|---|---:|
+| модель | `best.onnx` |
+| уверенность `--conf` | 0.45 |
+| IoU для NMS `--iou` | 0.45 |
+| интервал кликов по `game` | 0.08 с |
+| улучшение | раз в 30 с |
+| бонус | раз в 12 с |
+| кулдаун закрытия рекламы | 3 с |
 
 Полезные команды:
 
 ```powershell
 python app.py --list-windows                     # список окон и их координат
-python app.py --model best.pt --dry-run --preview --max-seconds 15
-python app.py --model best.pt --crop-window      # захватывать только окно игры
-python app.py --model best.pt --no-close-ads     # не закрывать рекламу
-python app.py --model best.pt --no-bonuses       # только game + improvement
-python app.py --model best.pt --no-improvements  # без покупок улучшений
-python app.py --model best.pt --allow-any-window # если окно игры не найдено
+python app.py --preview --dry-run --max-seconds 15  # превью только для отладки
+python app.py --crop-window                      # захватывать только окно игры
+python app.py --conf 0.55                        # строже фильтр уверенности
+python app.py --no-close-ads                     # не закрывать рекламу
+python app.py --no-bonuses                       # только game + improvement
+python app.py --no-improvements                  # без покупок улучшений
+python app.py --allow-any-window                 # если окно игры не найдено
 ```
 
-По умолчанию: улучшение раз в **30 с**, бонус раз в **12 с**, кулдаун закрытия
-рекламы **3 с**, реклама закрывается автоматически.
+Горячие клавиши: **Пробел** — остановка, `F8` — пауза/продолжить,
+`F9`/`Esc` — выход, `Ctrl+C` — выход из консоли.
+
+Превью (`--preview`) предназначено для отладки: окно превью перехватывает
+фокус, поэтому для реальных кликов запускайте бота без него (или держите окно
+игры активным и не перекрывайте его превью).
 
 Если игра открыта в браузере, её заголовок обычно содержит слово «Кликер».
 Если нет — укажите свою часть заголовка: `--window "Яндекс Игры"`.
@@ -148,10 +180,10 @@ X-AnyLabeling      → screenshots/*.json             (ручная размет
 X-AnyLabeling      → level 2/*.json, advertising/*.json
 build_dataset.py   → dataset_final + data_final.yaml (game, improvement, advertising, bonus)
 train_final.py     → runs/detect/clicker_levels     (fine-tune итоговой модели)
-validate.py        → docs/metrics.json, docs/training, docs/examples
+validate.py        → docs/metrics.json, docs/examples
 check_detections.py→ TP/FP/FN и проверка фильтров app.py
-ptToOnnx.py        → best.onnx                      (для X-AnyLabeling)
-app.py             → бот
+ptToOnnx.py        → best.onnx                      (для бота и X-AnyLabeling)
+app.py             → бот на ONNX Runtime
 ```
 
 Команды:
@@ -159,16 +191,20 @@ app.py             → бот
 ```powershell
 python screener.py --window "Кликер" --interval 2 --out screenshots
 python build_dataset.py       # соберёт dataset_final из трёх папок с разметкой
-python train_final.py         # дообучение от текущего best.pt
-python validate.py --model best.pt --data data_final.yaml
-python check_detections.py --model best.pt --conf 0.35
-python ptToOnnx.py            # экспорт best.pt → best.onnx
+python train_final.py --weights path/to/previous_best.pt
+python validate.py --data data_final.yaml
+python check_detections.py --conf 0.35
+python ptToOnnx.py            # runs/.../best.pt → best.onnx
 ```
+
+Датасет и промежуточные веса в репозиторий не входят: для повторного обучения
+подготовьте их локально. Готовые `best.onnx` и
+`runs/detect/clicker_levels/weights/best.pt` уже есть в репозитории.
 
 Для авторазметки новых кадров обученной моделью:
 
 ```powershell
-python auto_label.py --model best.pt --source new_frames --out auto_labels
+python auto_label.py --model best.onnx --source new_frames --out auto_labels
 ```
 
 Результат можно открыть в X-AnyLabeling, проверить и поправить. Для работы
@@ -179,7 +215,7 @@ python auto_label.py --model best.pt --source new_frames --out auto_labels
 
 ```text
 Clicker_AI/
-├── app.py                  # бот: детекция, клики, улучшения, бонусы, реклама
+├── app.py                  # бот на ONNX Runtime: детекция, клики, улучшения, бонусы, реклама
 ├── screener.py             # автоматический сбор скриншотов окна игры
 ├── auto_label.py           # авторазметка моделью → JSON X-AnyLabeling + YOLO txt
 ├── build_dataset.py        # сборка датасета из трёх источников разметки
@@ -191,17 +227,24 @@ Clicker_AI/
 ├── data_final.yaml         # конфиг датасета (nc=4)
 ├── my_cookie_model.yaml    # конфиг кастомной модели для X-AnyLabeling
 ├── requirements.txt
-├── best.pt                 # итоговая модель YOLOv8n (4 класса)
-├── best.onnx               # она же в ONNX
-├── bestV1.pt               # исходная модель пользователя (не используется)
-├── dataset_final/          # размеченный датасет (images + labels)
-├── screenshots/            # исходные скриншоты 1-го уровня (локально)
-├── level 2/                # скриншоты и разметка 2-го уровня (локально)
-├── advertising/            # скриншоты и разметка рекламы (локально)
+├── best.onnx               # итоговая модель для app.py (ONNX Runtime)
+├── runs/
+│   └── detect/
+│       └── clicker_levels/ # единственный сохранённый прогон обучения
+│           ├── weights/best.pt
+│           ├── results.png / results.csv
+│           ├── confusion_matrix*.png
+│           └── val_batch0_*.jpg
 └── docs/
-    ├── examples/           # примеры детекции
-    └── training/           # графики, матрица ошибок, кривые
+    ├── examples/           # три примера детекции
+    ├── app_test.txt        # лог сквозных тестов
+    ├── metrics.json        # метрики обучения
+    ├── check.json          # TP/FP/FN
+    └── pipeline.png
 ```
+
+Локально (не в Git): `dataset_final/`, `screenshots/`, `level 2/`,
+`advertising/`, `best.pt`, `bestV1.pt` — исходные данные и промежуточные модели.
 
 ## Как это работает
 
@@ -216,10 +259,11 @@ Clicker_AI/
 4. **Обучение.** Итоговая модель — YOLOv8n с 4 классами, дообученная от
    предыдущей версии на объединённом датасете. Встроенные аугментации
    Ultralytics: mosaic, HSV, масштаб, сдвиг.
-5. **Инференс.** `app.py` делает скриншот, запускает модель и выбирает лучшие
-   рамки после геометрических фильтров. Клик по `game`, закрытие рекламы,
-   покупка улучшения и нажатие бонуса используют один низкоуровневый примитив
-   `click_box()`, поэтому логика не дублируется.
+5. **Инференс.** `app.py` делает скриншот, выполняет letterbox 640×640,
+   запускает ONNX Runtime, применяет class-aware NMS и геометрические фильтры.
+   Клик по `game`, закрытие рекламы, покупка улучшения и нажатие бонуса
+   используют один низкоуровневый примитив `click_box()`, поэтому логика не
+   дублируется.
 6. **Планировщик улучшений.** Раз в 30 секунд бот покупает одну кнопку
    `improvement`, циклически переходя к следующей, и сразу возвращается к кликам
    по `game`. Если кнопок не видно, попытка повторяется через секунду.
@@ -254,16 +298,25 @@ data_final.yaml`: mAP, precision, recall). Авторазметка отвеча
   перекрыто другим окном. Защита — проверка активного заголовка и `--dry-run`.
 * Автоматическое закрытие рекламы может случайно нажать на элемент интерфейса,
   если модель ошибётся; для отладки есть `--dry-run` и `--no-close-ads`.
+* Скорость на CPU — около 6–9 FPS для кадра 1920×1080; для более высокой
+  частоты можно уменьшить окно захвата (`--crop-window`) или размер входа модели.
 
 ## Публикация на GitHub
 
 Репозиторий проекта: **https://github.com/egormorozov708-hub/clicker-ai**
+
+В репозитории нет датасета, виртуальных окружений и старых весов — только код,
+`best.onnx`, один лучший прогон в `runs/detect/clicker_levels/` и отчёт.
 
 Клонирование и запуск:
 
 ```powershell
 git clone https://github.com/egormorozov708-hub/clicker-ai.git
 cd clicker-ai
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+python app.py --preview
 ```
 
 Обновление репозитория после изменений:
