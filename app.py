@@ -992,6 +992,15 @@ def main() -> None:
         f"{cfg.click_interval * 1000:.0f} мс."
     )
     print(
+        f"Уверенность: {cfg.conf:.2f}, IoU: {cfg.iou:.2f}, "
+        f"макс. детекций: {cfg.max_det}."
+    )
+    print(
+        f"Кулдауны: реклама {cfg.ad_cooldown:.1f} с, "
+        f"улучшение {cfg.upgrade_interval:.1f} с, "
+        f"бонус {cfg.bonus_interval:.1f} с."
+    )
+    print(
         f"Улучшения: раз в {cfg.upgrade_interval:.0f} с по очереди; "
         f"реклама: {'автоматически' if cfg.close_ads else 'выключена'}."
     )
