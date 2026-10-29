@@ -29,7 +29,10 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,14 +42,17 @@ import onnxruntime as ort
 import pyautogui
 import pygetwindow as gw
 
+try:
+    import mss
+except ImportError:  # mss не обязателен: есть резервный pyautogui.screenshot
+    mss = None
+
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE = 0.0
 
 # На Windows при масштабировании интерфейса (125 %, 150 %) координаты pyautogui
 # могут не совпадать с пикселями скриншота. Включаем DPI-awareness.
 try:
-    import ctypes
-
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
 except Exception:
     pass
@@ -64,13 +70,19 @@ CLASS_NAMES_DEFAULT = ["game", "improvement", "advertising", "bonus"]
 
 
 def load_class_names() -> list[str]:
-    """Имена классов из classes.txt рядом с app.py (или значения по умолчанию)."""
-    path = Path(__file__).with_name("classes.txt")
-    if path.exists():
-        names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
-        names = [name for name in names if name]
-        if names:
-            return names
+    """Имена классов из classes.txt рядом с app.py, exe или в _MEIPASS."""
+    candidates = [Path(__file__).with_name("classes.txt")]
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).with_name("classes.txt"))
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "classes.txt")
+    for path in candidates:
+        if path.exists():
+            names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+            names = [name for name in names if name]
+            if names:
+                return names
     return CLASS_NAMES_DEFAULT
 
 
@@ -88,9 +100,15 @@ class Config:
     threads: int = 0
     click_interval: float = 0.01
     click_burst: int = 3
+    native_click: bool = False
     upgrade_interval: float = 30.0
     bonus_interval: float = 12.0
     ad_cooldown: float = 3.0
+    ad_settle: float = 1.0
+    improvement_settle: float = 0.4
+    empty_retry: float = 1.0
+    window_refresh: float = 1.0
+    verbose: bool = False
     click_game: bool = True
     click_improvements: bool = True
     click_bonuses: bool = True
@@ -112,8 +130,10 @@ class Stats:
     resume_game_at: float = 0.0
     next_upgrade_at: float = 0.0
     next_bonus_at: float = 0.0
-    improvement_idx: int = 0
-    bonus_idx: int = 0
+    # Стабильные ID кнопок, уже нажатых в текущем круге. Индексация по
+    # пересортированному списку ломалась, когда UI менял состав кнопок.
+    improvement_seen: list[tuple[float, float]] = field(default_factory=list)
+    bonus_seen: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def clicks(self) -> int:
@@ -128,9 +148,17 @@ class Stats:
 def find_window(title_part: str):
     candidates = []
     for window in gw.getAllWindows():
-        title = (window.title or "").strip()
-        if title and title_part.lower() in title.lower() and window.width > 300:
+        try:
+            title = (window.title or "").strip()
+            if not title or title_part.lower() not in title.lower():
+                continue
+            if window.width <= 300 or window.height <= 200:
+                continue
+            if getattr(window, "isMinimized", False):
+                continue
             candidates.append(window)
+        except Exception:
+            continue
     if not candidates:
         return None
     return max(candidates, key=lambda w: w.width * w.height)
@@ -144,7 +172,26 @@ def list_windows() -> None:
             print(f"  {title!r}  ({window.left},{window.top},{window.width},{window.height})")
 
 
+_mss_instance = None
+_mss_disabled = False
+
+
 def grab_screen(region: tuple[int, int, int, int] | None) -> np.ndarray:
+    """Захват экрана через mss (быстро), с резервом на pyautogui."""
+    global _mss_instance, _mss_disabled
+    if mss is not None and not _mss_disabled:
+        try:
+            if _mss_instance is None:
+                factory = getattr(mss, "MSS", None) or mss.mss
+                _mss_instance = factory()
+            monitor = region if region is not None else _mss_instance.monitors[1]
+            shot = _mss_instance.grab(monitor)
+            # mss отдаёт BGRA. cvtColor быстрее ломтика с copy() и сразу
+            # делает массив непрерывным — детектору так тоже быстрее.
+            return cv2.cvtColor(np.asarray(shot), cv2.COLOR_BGRA2BGR)
+        except Exception as exc:
+            _mss_disabled = True
+            print(f"mss недоступен ({exc}); перехожу на pyautogui.screenshot.")
     image = pyautogui.screenshot(region=region)
     frame = np.array(image)
     return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
@@ -155,49 +202,69 @@ def center(box: list[float]) -> tuple[int, int]:
     return int((x1 + x2) / 2), int((y1 + y2) / 2)
 
 
+def stable_id(box: list[float], frame_w: int, frame_h: int) -> tuple[float, float]:
+    """Нормализованный центр кнопки — не зависит от порядка сортировки."""
+    cx, cy = center(box)
+    return cx / max(1, frame_w), cy / max(1, frame_h)
+
+
+def already_seen(
+    point: tuple[float, float], seen: list[tuple[float, float]]
+) -> bool:
+    """Совпадение кнопки с уже нажатой с допуском 2 % кадра.
+
+    Допуск убирает ложные «новые кнопки» при дрожании детекции на несколько
+    пикселей и при небольшом сдвиге окна.
+    """
+    return any(
+        abs(point[0] - other[0]) <= 0.02 and abs(point[1] - other[1]) <= 0.02
+        for other in seen
+    )
+
+
 def canonical(name: str) -> str:
     return ALIASES.get(name, name)
 
 
-def valid_game_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+def game_box_reason(box: list[float], frame_w: int, frame_h: int) -> str | None:
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
     if w < 12 or h < 35:
-        return False
+        return "слишком маленькая рамка"
     if h / max(w, 1.0) < 0.65:
-        return False
+        return "не вытянутая форма"
     if (x1 + x2) / 2 > frame_w * 0.97:  # правая колонка с рекламой
-        return False
-    return True
+        return "правая колонка с рекламой"
+    return None
 
 
-def valid_improvement_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+def improvement_box_reason(box: list[float], frame_w: int, frame_h: int) -> str | None:
     """Кнопки покупки — широкие, в нижней левой части игрового поля."""
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
     if w < 70 or h < 28:
-        return False
+        return "слишком маленькая рамка"
     if not (1.0 <= w / max(h, 1.0) <= 8.0):
-        return False
+        return "неверные пропорции"
     if x1 > frame_w * 0.65 or y1 < frame_h * 0.45:
-        return False
-    return True
+        return "не нижняя левая часть"
+    return None
 
 
-def valid_bonus_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+def bonus_box_reason(box: list[float], frame_w: int, frame_h: int) -> str | None:
     """2X / +1K — квадратные кнопки в верхней левой части."""
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
     if w < 55 or h < 45:
-        return False
+        return "слишком маленькая рамка"
     if not (0.5 <= w / max(h, 1.0) <= 2.2):
-        return False
+        return "неверные пропорции"
     if x2 > frame_w * 0.75 or y2 > frame_h * 0.45:
-        return False
-    return True
+        return "не верхняя левая часть"
+    return None
 
 
-def valid_ad_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+def ad_box_reason(box: list[float], frame_w: int, frame_h: int) -> str | None:
     """Крестик рекламы: маленький, почти квадратный, в правой части кадра.
 
     Попап может располагаться выше или ниже в зависимости от положения окна
@@ -207,13 +274,50 @@ def valid_ad_box(box: list[float], frame_w: int, frame_h: int) -> bool:
     x1, y1, x2, y2 = box
     w, h = x2 - x1, y2 - y1
     if not (40 <= w <= 200 and 40 <= h <= 200):
-        return False
+        return "неподходящий размер"
     if not (0.6 <= w / max(h, 1.0) <= 2.2):
-        return False
+        return "неверные пропорции"
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
     if cx < frame_w * 0.45 or cy > frame_h * 0.85:
-        return False
-    return True
+        return "не правый верх"
+    return None
+
+
+def valid_game_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+    return game_box_reason(box, frame_w, frame_h) is None
+
+
+def valid_improvement_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+    return improvement_box_reason(box, frame_w, frame_h) is None
+
+
+def valid_bonus_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+    return bonus_box_reason(box, frame_w, frame_h) is None
+
+
+def valid_ad_box(box: list[float], frame_w: int, frame_h: int) -> bool:
+    return ad_box_reason(box, frame_w, frame_h) is None
+
+
+BOX_REASONS = {
+    "game": game_box_reason,
+    "improvement": improvement_box_reason,
+    "advertising": ad_box_reason,
+    "bonus": bonus_box_reason,
+}
+
+
+def rejection_details(
+    detections: list[Detection], frame_w: int, frame_h: int
+) -> dict[str, Counter]:
+    """Причины, по которым рамки не прошли геометрические фильтры (--verbose)."""
+    details: dict[str, Counter] = {}
+    for name, _score, box in detections:
+        checker = BOX_REASONS.get(name)
+        reason = checker(box, frame_w, frame_h) if checker else "неизвестный класс"
+        if reason:
+            details.setdefault(name, Counter())[reason] += 1
+    return details
 
 
 Detection = tuple[str, float, list[float]]
@@ -374,6 +478,30 @@ def pick(
     return best
 
 
+def failsafe_check() -> None:
+    """Проверка угла экрана для нативного клика (pyautogui делает её сам)."""
+    if not pyautogui.FAILSAFE:
+        return
+    x, y = pyautogui.position()
+    width, height = pyautogui.size()
+    if (x, y) in ((0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)):
+        raise pyautogui.FailSafeException
+
+
+def native_click(x: int, y: int) -> bool:
+    """Быстрый клик через WinAPI. False, если платформа не поддерживается."""
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.SetCursorPos(int(x), int(y))
+        user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+        user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+        return True
+    except Exception:
+        return False
+
+
 def click_box(
     box: list[float],
     offset: tuple[int, int],
@@ -382,10 +510,16 @@ def click_box(
 ) -> None:
     """Единый низкоуровневый клик: и для game, и для рекламы, и для кнопок."""
     x, y = center(box)
-    if not cfg.dry_run:
-        pyautogui.click(offset[0] + x, offset[1] + y)
-    elif label != "game":
-        print(f"[dry-run] клик: {label} в ({offset[0] + x}, {offset[1] + y})")
+    if cfg.dry_run:
+        if label != "game":
+            print(f"[dry-run] клик: {label} в ({offset[0] + x}, {offset[1] + y})")
+        return
+    px, py = offset[0] + x, offset[1] + y
+    if cfg.native_click:
+        failsafe_check()
+        if native_click(px, py):
+            return
+    pyautogui.click(px, py)
 
 
 def click_game(
@@ -403,7 +537,7 @@ def click_game(
     if now - stats.last_game_click < cfg.click_interval:
         return False
     # За один кадр делаем несколько кликов: инференс ограничивает цикл
-    # примерно 6–9 FPS, поэтому без серии быстрее кликать не получится.
+    # примерно 9–10 FPS, поэтому без серии быстрее кликать не получится.
     for index in range(cfg.click_burst):
         if index:
             time.sleep(cfg.click_interval)
@@ -433,7 +567,7 @@ def close_ad(
     click_box(ad[2], offset, cfg, "advertising")
     stats.ad_clicks += 1
     stats.last_ad_click = now
-    stats.resume_game_at = now + 1.0  # даём окну рекламы закрыться
+    stats.resume_game_at = now + cfg.ad_settle  # даём окну рекламы закрыться
     prefix = "[dry-run] " if cfg.dry_run else ""
     print(f"{prefix}Реклама закрыта (уверенность {ad[1]:.2f}), возвращаюсь к game.")
     return True
@@ -462,18 +596,34 @@ def buy_improvement(
         key=lambda d: (d[2][1], d[2][0]),
     )
     if not improvements:
-        stats.next_upgrade_at = now + 1.0
+        stats.next_upgrade_at = now + cfg.empty_retry
         return False
-    index = stats.improvement_idx % len(improvements)
-    box = improvements[index][2]
-    click_box(box, offset, cfg, f"improvement {index + 1}/{len(improvements)}")
+    # Стабильные ID вместо индекса в пересортированном списке: новая кнопка
+    # или сдвиг старой больше не сбивает очередь. Когда все видимые кнопки
+    # нажаты, начинается новый круг.
+    buttons = [
+        (position, stable_id(d[2], frame_w, frame_h), d)
+        for position, d in enumerate(improvements)
+    ]
+    fresh = [
+        item for item in buttons
+        if not already_seen(item[1], stats.improvement_seen)
+    ]
+    if not fresh:
+        stats.improvement_seen.clear()
+        fresh = buttons
+    position, button_id, detection = fresh[0]
+    stats.improvement_seen.append(button_id)
+    click_box(
+        detection[2], offset, cfg,
+        f"improvement {position + 1}/{len(improvements)}",
+    )
     stats.improvement_clicks += 1
-    stats.improvement_idx += 1
     stats.next_upgrade_at = now + cfg.upgrade_interval
-    stats.resume_game_at = now + 0.4
+    stats.resume_game_at = now + cfg.improvement_settle
     prefix = "[dry-run] " if cfg.dry_run else ""
     print(
-        f"{prefix}Купил улучшение {index + 1}/{len(improvements)}; "
+        f"{prefix}Купил улучшение {position + 1}/{len(improvements)}; "
         f"следующее через {cfg.upgrade_interval:.0f} с, возвращаюсь к game."
     )
     return True
@@ -501,12 +651,26 @@ def click_bonus(
         key=lambda d: (d[2][1], d[2][0]),
     )
     if not bonuses:
-        stats.next_bonus_at = now + 1.0
+        stats.next_bonus_at = now + cfg.empty_retry
         return False
-    index = stats.bonus_idx % len(bonuses)
-    click_box(bonuses[index][2], offset, cfg, f"bonus {index + 1}/{len(bonuses)}")
+    buttons = [
+        (position, stable_id(d[2], frame_w, frame_h), d)
+        for position, d in enumerate(bonuses)
+    ]
+    fresh = [
+        item for item in buttons
+        if not already_seen(item[1], stats.bonus_seen)
+    ]
+    if not fresh:
+        stats.bonus_seen.clear()
+        fresh = buttons
+    position, button_id, detection = fresh[0]
+    stats.bonus_seen.append(button_id)
+    click_box(
+        detection[2], offset, cfg,
+        f"bonus {position + 1}/{len(bonuses)}",
+    )
     stats.bonus_clicks += 1
-    stats.bonus_idx += 1
     stats.next_bonus_at = now + cfg.bonus_interval
     return True
 
@@ -583,7 +747,15 @@ class Preview:
             return -1
         if self.backend == "opencv":
             cv2.imshow("Clicker AI", frame)
-            return cv2.waitKey(1) & 0xFF
+            key = cv2.waitKey(1) & 0xFF
+            try:
+                visible = cv2.getWindowProperty("Clicker AI", cv2.WND_PROP_VISIBLE)
+            except cv2.error:
+                visible = 0
+            if visible < 1:
+                self.closed = True
+                return -1
+            return key
 
         height, width = frame.shape[:2]
         scale = min(self.max_width / width, self.max_height / height, 1.0)
@@ -662,12 +834,24 @@ def build_parser() -> argparse.ArgumentParser:
                         help="пауза между кликами по game, секунды (по умолчанию 0.01)")
     parser.add_argument("--click-burst", type=int, default=3,
                         help="кликов по game за один кадр (1 = по одному клику)")
+    parser.add_argument("--native-click", action="store_true",
+                        help="быстрый клик через WinAPI вместо pyautogui")
     parser.add_argument("--upgrade-interval", type=float, default=30.0,
                         help="как часто покупать одно улучшение, секунды")
     parser.add_argument("--bonus-interval", type=float, default=12.0,
                         help="как часто нажимать бонус 2X/+1K, секунды")
     parser.add_argument("--ad-cooldown", type=float, default=3.0,
                         help="пауза между попытками закрыть рекламу, секунды")
+    parser.add_argument("--ad-settle", type=float, default=1.0,
+                        help="пауза после закрытия рекламы, секунды")
+    parser.add_argument("--improvement-settle", type=float, default=0.4,
+                        help="пауза после покупки улучшения, секунды")
+    parser.add_argument("--empty-retry", type=float, default=1.0,
+                        help="повтор, если нужные кнопки не найдены, секунды")
+    parser.add_argument("--window-refresh", type=float, default=1.0,
+                        help="как часто обновлять геометрию окна, секунды (0 = каждый кадр)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="показывать причины отбраковки детекций")
     parser.add_argument("--no-game", action="store_true")
     parser.add_argument("--no-improvements", "--no-upgrades", dest="no_improvements",
                         action="store_true")
@@ -691,7 +875,11 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--max-det должен быть >= 1")
     if args.threads < 0:
         parser.error("--threads должен быть >= 0")
-    for name in ("click_interval", "upgrade_interval", "bonus_interval", "ad_cooldown", "max_seconds"):
+    for name in (
+        "click_interval", "upgrade_interval", "bonus_interval", "ad_cooldown",
+        "ad_settle", "improvement_settle", "empty_retry", "window_refresh",
+        "max_seconds",
+    ):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} должен быть >= 0")
     if args.click_burst < 1:
@@ -720,9 +908,15 @@ def main() -> None:
         threads=args.threads,
         click_interval=args.click_interval,
         click_burst=args.click_burst,
+        native_click=args.native_click,
         upgrade_interval=args.upgrade_interval,
         bonus_interval=args.bonus_interval,
         ad_cooldown=args.ad_cooldown,
+        ad_settle=args.ad_settle,
+        improvement_settle=args.improvement_settle,
+        empty_retry=args.empty_retry,
+        window_refresh=args.window_refresh,
+        verbose=args.verbose,
         click_game=not args.no_game,
         click_improvements=not args.no_improvements,
         click_bonuses=not args.no_bonuses,
@@ -752,6 +946,10 @@ def main() -> None:
         raise SystemExit(f"Не удалось загрузить ONNX-модель: {exc}") from exc
     print(f"ONNX Runtime {ort.__version__}, вход {detector.imgsz}x{detector.imgsz}")
     print("Классы:", {i: name for i, name in enumerate(detector.names)})
+    print(
+        f"Захват экрана: {'mss' if mss is not None else 'pyautogui'}; "
+        f"клик: {'WinAPI' if cfg.native_click else 'pyautogui'}."
+    )
 
     window = find_window(cfg.window)
     if window:
@@ -770,9 +968,13 @@ def main() -> None:
     state = {"running": True, "paused": False}
     listener = setup_hotkeys(state)
     stats = Stats()
-    now = time.time()
+    now = stats.started
     stats.next_upgrade_at = now + cfg.upgrade_interval
     stats.next_bonus_at = now + cfg.bonus_interval
+    last_window_geometry = (
+        (window.left, window.top, window.width, window.height) if window else None
+    )
+    next_window_check = time.time() + cfg.window_refresh
 
     print("Старт. Пробел — стоп, F8 — пауза, F9/Esc — выход." if listener else "Старт. Остановка: Ctrl+C.")
     if cfg.dry_run:
@@ -807,6 +1009,28 @@ def main() -> None:
                 time.sleep(0.1)
                 continue
 
+            # Геометрия окна могла измениться: пользователь передвинул окно,
+            # изменил размер или перезапустил игру. Обновляем её по таймеру.
+            now = time.time()
+            if now >= next_window_check:
+                refreshed = find_window(cfg.window)
+                if refreshed is None:
+                    if window is not None:
+                        window = None
+                        last_window_geometry = None
+                        print(f"Окно «{cfg.window}» потеряно; ищу его снова.")
+                else:
+                    geometry = (
+                        refreshed.left, refreshed.top,
+                        refreshed.width, refreshed.height,
+                    )
+                    changed = window is None or geometry != last_window_geometry
+                    window = refreshed
+                    last_window_geometry = geometry
+                    if changed:
+                        print(f"Окно игры: {window.title!r} {geometry}")
+                next_window_check = now + cfg.window_refresh
+
             region = None
             offset = (0, 0)
             try:
@@ -824,7 +1048,11 @@ def main() -> None:
                     raise
 
             frame_h, frame_w = frame.shape[:2]
-            detections = detector.detect(frame, cfg.conf)
+            try:
+                detections = detector.detect(frame, cfg.conf)
+            except Exception as exc:
+                print(f"Ошибка инференса: {exc}. Бот остановлен.")
+                break
             detections.sort(key=lambda d: d[1], reverse=True)
             stats.frames += 1
 
@@ -879,6 +1107,14 @@ def main() -> None:
                     + ("" if game_active else " | окно игры не активно")
                     + (" [dry-run]" if cfg.dry_run else "")
                 )
+                if cfg.verbose:
+                    rejected = rejection_details(detections, frame_w, frame_h)
+                    for name, reasons in rejected.items():
+                        details = ", ".join(
+                            f"{reason} x{count}"
+                            for reason, count in reasons.most_common()
+                        )
+                        print(f"  отброшено {name}: {details}")
                 last_log = now
 
     except pyautogui.FailSafeException:
