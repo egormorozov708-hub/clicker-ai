@@ -144,10 +144,14 @@ python app.py --dry-run --upgrade-interval 3 --max-seconds 20
 | модель | `best.onnx` |
 | уверенность `--conf` | 0.45 |
 | IoU для NMS `--iou` | 0.45 |
-| интервал кликов по `game` | 0.08 с |
+| кликов по `game` за кадр `--click-burst` | 3 |
+| пауза между кликами `--click-interval` | 0.01 с |
 | улучшение | раз в 30 с |
 | бонус | раз в 12 с |
 | кулдаун закрытия рекламы | 3 с |
+
+Реальная скорость — примерно FPS × `--click-burst` кликов в секунду: цикл
+детекции на CPU даёт 6–9 FPS, поэтому по умолчанию выходит около 18–27 кликов/с.
 
 Полезные команды:
 
@@ -156,6 +160,8 @@ python app.py --list-windows                     # список окон и их
 python app.py --preview --dry-run --max-seconds 15  # превью только для отладки
 python app.py --crop-window                      # захватывать только окно игры
 python app.py --conf 0.55                        # строже фильтр уверенности
+python app.py --click-burst 5                    # ещё быстрее: 5 кликов за кадр
+python app.py --click-burst 1                    # по одному клику за кадр
 python app.py --no-close-ads                     # не закрывать рекламу
 python app.py --no-bonuses                       # только game + improvement
 python app.py --no-improvements                  # без покупок улучшений

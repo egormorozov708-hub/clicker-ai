@@ -86,7 +86,8 @@ class Config:
     iou: float = 0.45
     max_det: int = 100
     threads: int = 0
-    click_interval: float = 0.08
+    click_interval: float = 0.01
+    click_burst: int = 3
     upgrade_interval: float = 30.0
     bonus_interval: float = 12.0
     ad_cooldown: float = 3.0
@@ -401,9 +402,14 @@ def click_game(
         return False
     if now - stats.last_game_click < cfg.click_interval:
         return False
-    click_box(best[2], offset, cfg, "game")
-    stats.game_clicks += 1
-    stats.last_game_click = now
+    # За один кадр делаем несколько кликов: инференс ограничивает цикл
+    # примерно 6–9 FPS, поэтому без серии быстрее кликать не получится.
+    for index in range(cfg.click_burst):
+        if index:
+            time.sleep(cfg.click_interval)
+        click_box(best[2], offset, cfg, "game")
+        stats.game_clicks += 1
+    stats.last_game_click = time.time()
     return True
 
 
@@ -652,8 +658,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="максимум детекций на кадр")
     parser.add_argument("--threads", type=int, default=0,
                         help="потоки ONNX Runtime; 0 = авто")
-    parser.add_argument("--click-interval", type=float, default=0.08,
-                        help="пауза между кликами по game, секунды")
+    parser.add_argument("--click-interval", type=float, default=0.01,
+                        help="пауза между кликами по game, секунды (по умолчанию 0.01)")
+    parser.add_argument("--click-burst", type=int, default=3,
+                        help="кликов по game за один кадр (1 = по одному клику)")
     parser.add_argument("--upgrade-interval", type=float, default=30.0,
                         help="как часто покупать одно улучшение, секунды")
     parser.add_argument("--bonus-interval", type=float, default=12.0,
@@ -686,6 +694,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     for name in ("click_interval", "upgrade_interval", "bonus_interval", "ad_cooldown", "max_seconds"):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} должен быть >= 0")
+    if args.click_burst < 1:
+        parser.error("--click-burst должен быть >= 1")
 
 
 def main() -> None:
@@ -709,6 +719,7 @@ def main() -> None:
         max_det=args.max_det,
         threads=args.threads,
         click_interval=args.click_interval,
+        click_burst=args.click_burst,
         upgrade_interval=args.upgrade_interval,
         bonus_interval=args.bonus_interval,
         ad_cooldown=args.ad_cooldown,
@@ -766,6 +777,10 @@ def main() -> None:
     print("Старт. Пробел — стоп, F8 — пауза, F9/Esc — выход." if listener else "Старт. Остановка: Ctrl+C.")
     if cfg.dry_run:
         print("Режим --dry-run: кликов не будет, действия только пишутся в лог.")
+    print(
+        f"Клики по game: {cfg.click_burst} за кадр, пауза "
+        f"{cfg.click_interval * 1000:.0f} мс."
+    )
     print(
         f"Улучшения: раз в {cfg.upgrade_interval:.0f} с по очереди; "
         f"реклама: {'автоматически' if cfg.close_ads else 'выключена'}."
