@@ -796,22 +796,52 @@ class Preview:
                 pass
 
 
+def stop_program(state: dict, reason: str) -> None:
+    """Попросить главный цикл завершиться ровно один раз."""
+    if state.get("stopping"):
+        return
+    state["stopping"] = True
+    state["running"] = False
+    print(f"{reason} — остановка.")
+
+
+def space_down() -> bool:
+    """Резервная проверка Пробела через WinAPI.
+
+    pynput может не получать клавиши, если игра запущена с другими правами
+    или глобальный хук заблокирован. GetAsyncKeyState работает без хука.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        # 0x8000 — клавиша нажата сейчас, 0x0001 — была нажата после
+        # предыдущего опроса (короткое нажатие между кадрами).
+        return bool(ctypes.windll.user32.GetAsyncKeyState(0x20) & 0x8001)
+    except Exception:
+        return False
+
+
 def setup_hotkeys(state: dict):
     try:
         from pynput import keyboard
-    except Exception:
+    except Exception as exc:
+        print(f"Глобальные горячие клавиши pynput недоступны: {exc}")
+        print("Пробел будет проверяться через WinAPI, выход — Ctrl+C.")
         return None
 
     def on_press(key):
-        if key == keyboard.Key.space:
-            print("Пробел — остановка.")
-            state["running"] = False
+        if (
+            key == keyboard.Key.space
+            or getattr(key, "char", None) == " "
+            or getattr(key, "vk", None) == 32
+        ):
+            stop_program(state, "Пробел")
             return False
         if key == keyboard.Key.f8:
             state["paused"] = not state["paused"]
             print("Пауза" if state["paused"] else "Продолжаем")
         elif key in (keyboard.Key.f9, keyboard.Key.esc):
-            state["running"] = False
+            stop_program(state, "Esc" if key == keyboard.Key.esc else "F9")
             return False
         return None
 
@@ -973,8 +1003,9 @@ def main() -> None:
                 "Укажите --window или --allow-any-window."
             )
 
-    state = {"running": True, "paused": False}
+    state = {"running": True, "paused": False, "stopping": False}
     listener = setup_hotkeys(state)
+    space_down()  # сбросить накопленный WinAPI-флаг до старта цикла
     stats = Stats()
     now = stats.started
     stats.next_upgrade_at = now + cfg.upgrade_interval
@@ -984,7 +1015,11 @@ def main() -> None:
     )
     next_window_check = time.time() + cfg.window_refresh
 
-    print("Старт. Пробел — стоп, F8 — пауза, F9/Esc — выход." if listener else "Старт. Остановка: Ctrl+C.")
+    print(
+        "Старт. Пробел — стоп, F8 — пауза, F9/Esc — выход."
+        if listener
+        else "Старт. Пробел — стоп (WinAPI), выход — Ctrl+C."
+    )
     if cfg.dry_run:
         print("Режим --dry-run: кликов не будет, действия только пишутся в лог.")
     print(
@@ -1020,6 +1055,11 @@ def main() -> None:
     last_log = time.time()
     try:
         while state["running"]:
+            # Пробел проверяем и через WinAPI: это работает, даже если
+            # pynput не получает клавиши в полноэкранной игре.
+            if space_down():
+                stop_program(state, "Пробел")
+                break
             if cfg.max_seconds and time.time() - stats.started > cfg.max_seconds:
                 break
             if state["paused"]:
